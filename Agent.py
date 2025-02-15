@@ -11,8 +11,11 @@ import streamlit as st
 import pandas as pd
 import base64
 from io import BytesIO
+from io import StringIO
+
 from together import Together
 from e2b_code_interpreter import Sandbox
+
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
@@ -38,8 +41,15 @@ def code_interpret(e2b_code_interpreter: Sandbox, code: str) -> Optional[List[An
 
         if exec.error:
             print(f"[Code Interpreter ERROR] {exec.error}", file=sys.stderr)
-            return None
-        return exec.results
+            results = exec.results
+        # Get the code execution results (DataFrames, plots, etc.)
+        results = exec.results 
+
+        dataset =e2b_code_interpreter.files.read('/home/user/preprocessed_dataset.csv')
+     
+        # Convert the CSV content string into a DataFrame
+        df = pd.read_csv(StringIO(dataset))
+        return results,exec.logs.stdout,df
 
 def match_code_blocks(llm_response: str) -> str:
     match = pattern.search(llm_response)
@@ -47,6 +57,19 @@ def match_code_blocks(llm_response: str) -> str:
         code = match.group(1)
         return code
     return ""
+
+
+def upload_dataset(code_interpreter: Sandbox, uploaded_file) -> str:
+    dataset_path = f"./{uploaded_file.name}"
+    
+    try:
+        code_interpreter.files.write(dataset_path, uploaded_file)
+        return dataset_path
+    except Exception as error:
+        st.error(f"Error during file upload: {error}")
+        raise error
+    
+
 
 def chat_with_llm(e2b_code_interpreter: Sandbox, user_message: str, dataset_path: str,dataset) -> Tuple[Optional[List[Any]], str]:
     
@@ -83,22 +106,88 @@ def chat_with_llm(e2b_code_interpreter: Sandbox, user_message: str, dataset_path
         python_code = match_code_blocks(response_message.content)
         
         if python_code:
-            code_interpreter_results = code_interpret(e2b_code_interpreter, python_code)
-            return code_interpreter_results, response_message.content
+            code_interpreter_results,text_output = code_interpret(e2b_code_interpreter, python_code)
+            return code_interpreter_results, response_message.content,text_output
         else:
             st.warning(f"Failed to match any Python code in model's response")
             return None, response_message.content
+        
 
-def upload_dataset(code_interpreter: Sandbox, uploaded_file) -> str:
-    dataset_path = f"./{uploaded_file.name}"
+
+def chat_with_llm2(e2b_code_interpreter: Sandbox, dataset_path: str,dataset) -> Tuple[Optional[List[Any]], str]:
     
+    # Read the dataset to get column information
     try:
-        code_interpreter.files.write(dataset_path, uploaded_file)
-        return dataset_path
-    except Exception as error:
-        st.error(f"Error during file upload: {error}")
-        raise error
+        df = dataset
+        columns_info = ", ".join(df.columns.tolist())
+        # Capture metadata as strings
+        buffer = io.StringIO()
+        df.info(buf=buffer)
+        df_info_str = buffer.getvalue()
+        df_head_str = df.head().to_string()
 
+        df_describe_str = df.describe().to_string()
+        df_nulls_str = df.isnull().sum().to_string()
+
+    except Exception as e:
+        st.error(f"Error reading dataset: {e}")
+        columns_info = "Unable to read column information"
+
+    system_prompt= f"""You're a Python data scientist. You are given a dataset at path '{dataset_path}'.
+
+        ### Metadata Overview:
+        - **Missing Values Per Column:**
+            {df_nulls_str}
+
+        - Data info: 
+            {df_info_str}
+
+        - **Statistical Summary:**
+            {df_describe_str}
+
+        - **First Few Rows Preview:**
+            {df_head_str}
+
+        You need to analyze the dataset and follow the following instructions by providing one chunk of Python code.
+
+        ### Instructions:
+            you need to preprocess this dataset by performing the following tasks:
+            0. Handling Outliers.
+            1. Handling Missing Values:
+            - For numerical columns: Fill missing values with the median.
+            - For categorical columns: Fill missing values with the mode.
+            2. Apply one-hot encoding to all categorical columns.
+            3. Standardize all numerical columns using StandardScaler.
+            4. Save the cleaned dataset to 'preprocessed_dataset.csv'.
+
+        IMPORTANT:
+        - Always use the dataset path variable '{dataset_path}' when reading the CSV file.
+        - Ensure the code is efficient, readable, and provides meaningful insights or visualizations.
+        - Format your response clearly and concisely.
+        """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    
+
+    with st.spinner('Getting response from Together AI LLM model...'):
+        client = Together(api_key=st.session_state.together_api_key)
+        response = client.chat.completions.create(
+            model=st.session_state.model_name,
+            messages=messages,
+        )
+
+        response_message = response.choices[0].message
+        python_code = match_code_blocks(response_message.content)
+        
+        if python_code:
+            code_interpreter_results,text_output,dataset = code_interpret(e2b_code_interpreter, python_code)
+            return code_interpreter_results, response_message.content,text_output,dataset
+        else:
+            st.warning(f"Failed to match any Python code in model's response")
+            return None, response_message.content,None,None
 
 def main():
     """Main Streamlit application."""
@@ -148,11 +237,9 @@ def main():
         else:
             st.write("Preview (first 5 rows):")
             st.dataframe(df.head())
-        # Query input
-        query = st.text_area("What would you like to know about your data?",
-                            "Can you compare the average cost for two people between different categories?")
-        
-        if st.button("Analyze"):
+
+        #The preProcessing: 
+        if st.button("PreProcesse"):
             if not st.session_state.together_api_key or not st.session_state.e2b_api_key:
                 st.error("Please enter both API keys in the sidebar.")
             else:
@@ -161,7 +248,7 @@ def main():
                     dataset_path = upload_dataset(code_interpreter, uploaded_file)
                     
                     # Pass dataset_path to chat_with_llm
-                    code_results, llm_response = chat_with_llm(code_interpreter, query, dataset_path,df)
+                    code_results, llm_response,text_output,preprocessed_dataset = chat_with_llm2(code_interpreter,dataset_path,df)
                     
                     # Display LLM's text response
                     st.write("AI Response:")
@@ -186,6 +273,50 @@ def main():
                                 st.dataframe(result)
                             else:
                                 st.write(result)  
+                    st.write("Code output") 
+                    st.write(text_output)
+                    st.write(preprocessed_dataset)
+        
+        # Query input
+        query = st.text_area("What would you like to know about your data?",
+                            "Can you compare the average cost for two people between different categories?")
+        
+        if st.button("Analyze"):
+            if not st.session_state.together_api_key or not st.session_state.e2b_api_key:
+                st.error("Please enter both API keys in the sidebar.")
+            else:
+                with Sandbox(api_key=st.session_state.e2b_api_key) as code_interpreter:
+                    # Upload the dataset
+                    dataset_path = upload_dataset(code_interpreter, uploaded_file)
+                    
+                    # Pass dataset_path to chat_with_llm
+                    code_results, llm_response,text_output = chat_with_llm(code_interpreter, query, dataset_path,df)
+                    
+                    # Display LLM's text response
+                    st.write("AI Response:")
+                    st.write(llm_response)
+                    
+                    # Display results/visualizations
+                    if code_results:
+                        for result in code_results:
+                            if hasattr(result, 'png') and result.png:  # Check if PNG data is available
+                                # Decode the base64-encoded PNG data
+                                png_data = base64.b64decode(result.png)
+                                
+                                # Convert PNG data to an image and display it
+                                image = Image.open(BytesIO(png_data))
+                                st.image(image, caption="Generated Visualization", use_container_width=False)
+                            elif hasattr(result, 'figure'):  # For matplotlib figures
+                                fig = result.figure  # Extract the matplotlib figure
+                                st.pyplot(fig)  # Display using st.pyplot
+                            elif hasattr(result, 'show'):  # For plotly figures
+                                st.plotly_chart(result)
+                            elif isinstance(result, (pd.DataFrame, pd.Series)):
+                                st.dataframe(result)
+                            else:
+                                st.write(result)  
+                    st.write("Code output") 
+                    st.write(text_output) 
 
 if __name__ == "__main__":
     main()
